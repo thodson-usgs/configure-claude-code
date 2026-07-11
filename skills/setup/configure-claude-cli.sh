@@ -315,6 +315,9 @@ if [ "$OUTPUT" = "launcher" ]; then
   # Absolute path to these scripts, baked so `claude-bedrock --update-profiles` can find
   # create/configure later (falls back gracefully in the wrapper if it ever moves).
   SETUP_DIR=$(cd "$(dirname "$0")" && pwd)
+  # Whether this launcher is app-scoped (name is bedrock-<project>-<app>.sh). --update
+  # must reconfigure the SAME way (with/without --app-id) so it rewrites this same file.
+  if [ -n "$APP_ID" ]; then APP_SCOPED=1; else APP_SCOPED=0; fi
 
   {
     cat <<EOF
@@ -333,6 +336,7 @@ EOF
     # Baked so `claude-bedrock --update-profiles` can re-run create + configure unattended.
     jq -rn --arg a "$RESOLVED_APP" --arg c "$RESOLVED_CONTACT" --arg d "$SETUP_DIR" \
       '"export CLAUDE_BEDROCK_APP=\($a|@sh)", "export CLAUDE_BEDROCK_CONTACT=\($c|@sh)", "export CLAUDE_BEDROCK_SETUP_DIR=\($d|@sh)"'
+    echo "export CLAUDE_BEDROCK_APP_SCOPED='$APP_SCOPED'"
     if [ -n "$EXTRA_EXPORTS" ]; then
       echo ""
       echo "# Profiles with no Claude Code tier (opus/sonnet/haiku). Uncomment ONE to"
@@ -417,9 +421,16 @@ EOF
           exit 1
         fi
         bash "$d/create-bedrock-profiles.sh" --project-id "$CLAUDE_BEDROCK_PROJECT" \
-          --app-id "$CLAUDE_BEDROCK_APP" --contact "$CLAUDE_BEDROCK_CONTACT" --region "$AWS_REGION" &&
-        bash "$d/configure-claude-cli.sh" --project-id "$CLAUDE_BEDROCK_PROJECT" \
-          --app-id "$CLAUDE_BEDROCK_APP" --region "$AWS_REGION" --output launcher --yes )
+          --app-id "$CLAUDE_BEDROCK_APP" --contact "$CLAUDE_BEDROCK_CONTACT" --region "$AWS_REGION" || exit $?
+        # Reconfigure the same way this launcher was created (app-scoped or not) so the
+        # same file is rewritten rather than a differently-named one.
+        if [ "${CLAUDE_BEDROCK_APP_SCOPED:-0}" = 1 ]; then
+          bash "$d/configure-claude-cli.sh" --project-id "$CLAUDE_BEDROCK_PROJECT" \
+            --app-id "$CLAUDE_BEDROCK_APP" --region "$AWS_REGION" --output launcher --yes
+        else
+          bash "$d/configure-claude-cli.sh" --project-id "$CLAUDE_BEDROCK_PROJECT" \
+            --region "$AWS_REGION" --output launcher --yes
+        fi )
       return $?
     fi
     ( source "$f" && exec claude "$@" )
