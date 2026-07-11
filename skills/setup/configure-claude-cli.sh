@@ -27,6 +27,8 @@ PROJECT_ID=""
 APP_ID=""
 OUTPUT="settings"
 ASSUME_YES=0
+AWS_PROFILE_ARG=""     # --aws-profile: pin the SSO profile; else bridge at runtime
+ISOLATE=1              # launcher mode: isolate Bedrock config; --shared-config disables
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 usage() {
@@ -54,6 +56,14 @@ Optional:
                                    opt-in per launch. The file is named
                                    ~/.claude/bedrock-<project>[-<app>].sh so the
                                    wrapper can switch between them.
+  --aws-profile NAME   AWS named profile Claude Code should use for Bedrock. Claude
+                       Code's SDK reads AWS_PROFILE (not AWS_DEFAULT_PROFILE), so
+                       without this the launcher bridges whatever profile your shell
+                       already uses. Omit to auto-detect / bridge at runtime.
+  --shared-config      Launcher mode only: DON'T isolate Bedrock's config directory.
+                       By default the launcher sets CLAUDE_CODE_USE_BEDROCK's config
+                       to ~/.claude-bedrock so a model pick in a Bedrock session can't
+                       rewrite the subscription's default model. This opts out.
   --yes, -y            Skip the settings-mode overwrite confirmation prompt.
 
 Examples:
@@ -64,14 +74,18 @@ EOF
   exit 1
 }
 
+# Value-taking flags read $2 via ${2:?...} so a flag given as the final token fails
+# with a clear message instead of a cryptic `$2: unbound variable` under `set -u`.
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --project-id)  PROJECT_ID="$2";  shift 2 ;;
-    --app-id)      APP_ID="$2";      shift 2 ;;
-    --region)      AWS_REGION="$2";  shift 2 ;;
-    --output)      OUTPUT="$2";      shift 2 ;;
-    --yes|-y)      ASSUME_YES=1;     shift   ;;
-    -h|--help)     usage ;;
+    --project-id)   PROJECT_ID="${2:?--project-id requires a value}";   shift 2 ;;
+    --app-id)       APP_ID="${2:?--app-id requires a value}";           shift 2 ;;
+    --region)       AWS_REGION="${2:?--region requires a value}";       shift 2 ;;
+    --output)       OUTPUT="${2:?--output requires a value}";           shift 2 ;;
+    --aws-profile)  AWS_PROFILE_ARG="${2:?--aws-profile requires a value}"; shift 2 ;;
+    --shared-config) ISOLATE=0;      shift   ;;
+    --yes|-y)       ASSUME_YES=1;    shift   ;;
+    -h|--help)      usage ;;
     *) echo "Unknown option: $1"; usage ;;
   esac
 done
@@ -85,6 +99,11 @@ if [[ "$OUTPUT" != "settings" && "$OUTPUT" != "launcher" ]]; then
   echo "Error: --output must be 'settings' or 'launcher' (got '$OUTPUT')."
   usage
 fi
+
+# The profile Claude Code's SDK should use: explicit --aws-profile, else whatever the
+# current shell already resolves (AWS_PROFILE, then AWS_DEFAULT_PROFILE). May be empty
+# in launcher mode, where the launcher bridges it dynamically at source time.
+RESOLVED_PROFILE="${AWS_PROFILE_ARG:-${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-}}}"
 
 # ── Preflight checks ─────────────────────────────────────────────────────────
 for cmd in aws jq; do
@@ -117,9 +136,30 @@ ALL_PROFILES=$(aws bedrock list-inference-profiles \
   --region "$AWS_REGION" \
   --output json)
 
-PROJECT_PROFILES=$(echo "$ALL_PROFILES" | jq -c --arg prefix "$PREFIX" \
-  '[.inferenceProfileSummaries[] | select(.inferenceProfileName | startswith($prefix))]')
+# A name prefix alone is ambiguous: '-' is the project/app delimiter AND a legal
+# character inside a project or app id, so "myproj-claude-" also matches a sibling
+# application's "myproj-claude-notebooks-..." profiles. Filter authoritatively by the
+# wma:* TAGS instead. The name prefix is only a cheap pre-filter to bound how many
+# per-profile tag lookups we do (profiles created by create-bedrock-profiles.sh always
+# start with "<project>-").
+CANDIDATES=$(echo "$ALL_PROFILES" | jq -c --arg p "${PROJECT_ID}-" \
+  '[.inferenceProfileSummaries[] | select(.inferenceProfileName | startswith($p))]')
 
+MATCHES=""
+while IFS= read -r PROF; do
+  ARN=$(echo "$PROF" | jq -r '.inferenceProfileArn')
+  TAGS=$(aws bedrock list-tags-for-resource --resource-arn "$ARN" --region "$AWS_REGION" \
+    --query 'tags' --output json 2>/dev/null || echo '[]')
+  # One jq pass pulls both tag values (empty string when a tag is absent).
+  IFS=$'\t' read -r PID AID < <(echo "$TAGS" | jq -r \
+    'from_entries as $t | "\($t["wma:project_id"] // "")\t\($t["wma:application_id"] // "")"')
+  [ "$PID" = "$PROJECT_ID" ] || continue
+  if [ -n "$APP_ID" ] && [ "$AID" != "$APP_ID" ]; then continue; fi
+  MATCHES="${MATCHES}${PROF}"$'\n'
+done < <(echo "$CANDIDATES" | jq -c '.[]')
+
+# Slurp the matched objects once rather than rebuilding a growing array each iteration.
+PROJECT_PROFILES=$(printf '%s' "$MATCHES" | jq -sc '.')
 PROFILE_COUNT=$(echo "$PROJECT_PROFILES" | jq length)
 if [ "$PROFILE_COUNT" -eq 0 ]; then
   echo "Error: no inference profiles found for ${SCOPE}." >&2
@@ -147,7 +187,7 @@ CLASSIFIED=$(echo "$PROJECT_PROFILES" | jq -c '
      elif ($model_id | test("sonnet-4-6")) then {tier: "SONNET", name: "Sonnet 4.6"}
      elif ($model_id | test("sonnet-4-5")) then {tier: "SONNET", name: "Sonnet 4.5"}
      elif ($model_id | test("sonnet-4-"))  then {tier: "SONNET", name: "Sonnet 4"}
-     elif ($model_id | test("sonnet-3-7")) then {tier: "SONNET", name: "Sonnet 3.7"}
+     elif ($model_id | test("3-7-sonnet")) then {tier: "SONNET", name: "Sonnet 3.7"}
      elif ($model_id | test("sonnet"))     then {tier: "SONNET", name: "Sonnet"}
      elif ($model_id | test("haiku-4-5"))  then {tier: "HAIKU",  name: "Haiku 4.5"}
      elif ($model_id | test("haiku"))      then {tier: "HAIKU",  name: "Haiku"}
@@ -202,8 +242,11 @@ for TIER in OPUS SONNET HAIKU; do
 done
 
 # ── Build the Bedrock env vars (shared by both output modes) ──────────────────
-ENV_JSON=$(echo "$TIER_MAP" | jq -c --arg pid "$PROJECT_ID" '
-  {"CLAUDE_CODE_USE_BEDROCK": "1"} +
+# Note: the "<name> (<project>)" display-name format below is parsed by statusline.sh
+# (it treats a name ending in "(<project>)" as a tagged/billable session) — keep the two
+# in sync if you change the suffix.
+ENV_JSON=$(echo "$TIER_MAP" | jq -c --arg pid "$PROJECT_ID" --arg region "$AWS_REGION" '
+  {"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": $region} +
   (to_entries | reduce .[] as $e ({};
     . + {
       ("ANTHROPIC_DEFAULT_" + $e.key + "_MODEL"): $e.value.arn,
@@ -236,10 +279,28 @@ if [ "$OUTPUT" = "launcher" ]; then
 
   # Profiles with no Claude Code tier (e.g. Fable) — Claude Code has no slot for
   # them, so expose each as a commented main-model override the user can enable.
-  # @sh shell-quotes each value safely, escaping any embedded quote — the same
-  # quoting used for every export line below, including AWS_REGION.
+  # .arn is the TAGGED application-inference-profile ARN, so enabling one keeps the
+  # session billed to this project. @sh shell-quotes each value safely.
   EXTRA_EXPORTS=$(echo "$PROFILE_EXTRAS" | jq -r \
-    '.[] | "# export ANTHROPIC_MODEL=\(.arn|@sh)  # \(.model)"')
+    '.[] | "# export ANTHROPIC_MODEL=\(.arn|@sh)  # \(.model) — tagged to this project"')
+
+  # AWS_PROFILE line: Claude Code's SDK reads AWS_PROFILE (NOT AWS_DEFAULT_PROFILE), so
+  # without it SSO credentials don't resolve and Bedrock calls hang ~60s then fail. Pin
+  # it when --aws-profile was given; otherwise bridge from whatever the shell resolves.
+  if [ -n "$AWS_PROFILE_ARG" ]; then
+    AWS_PROFILE_LINE=$(jq -rn --arg p "$AWS_PROFILE_ARG" '"export AWS_PROFILE=\($p|@sh)"')
+  else
+    AWS_PROFILE_LINE=': "${AWS_PROFILE:=${AWS_DEFAULT_PROFILE:-}}"; [ -n "${AWS_PROFILE:-}" ] && export AWS_PROFILE'
+  fi
+
+  # Isolated config dir keeps a model pick in a Bedrock session from rewriting the
+  # subscription's default model (they otherwise share ~/.claude/settings.json's model).
+  CONFIG_DIR="$HOME/.claude-bedrock"
+  if [ "$ISOLATE" -eq 1 ]; then
+    CONFIG_DIR_LINE='export CLAUDE_CONFIG_DIR="$HOME/.claude-bedrock"'
+  else
+    CONFIG_DIR_LINE='# config isolation disabled (--shared-config): shares ~/.claude'
+  fi
 
   {
     cat <<EOF
@@ -248,17 +309,40 @@ if [ "$OUTPUT" = "launcher" ]; then
 # Generated by configure-claude-cli.sh — source before launching Claude Code.
 # Requires an active AWS SSO session (aws sso login).
 
+# Claude Code's AWS SDK reads AWS_PROFILE (not AWS_DEFAULT_PROFILE). Override by
+# exporting AWS_PROFILE before launching.
+${AWS_PROFILE_LINE}
 EOF
-    jq -rn --arg r "$AWS_REGION" '"export AWS_REGION=\($r|@sh)"'
     echo "$ENV_JSON" | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"'
+    jq -rn --arg p "$PROJECT_ID" '"export CLAUDE_BEDROCK_PROJECT=\($p|@sh)  # statusline cost-attribution badge"'
+    echo "$CONFIG_DIR_LINE"
     if [ -n "$EXTRA_EXPORTS" ]; then
       echo ""
-      echo "# Profiles with no Claude Code tier (opus/sonnet/haiku). Uncomment ONE"
-      echo "# to use it as this session's main model:"
+      echo "# Profiles with no Claude Code tier (opus/sonnet/haiku). Uncomment ONE to"
+      echo "# use it as this session's main model (stays tagged to this project):"
       echo "$EXTRA_EXPORTS"
     fi
   } > "$LAUNCHER_FILE"
   echo "Wrote $LAUNCHER_FILE"
+
+  # Install the cost-attribution statusline badge and, when isolating, seed the Bedrock
+  # config dir to use it with a Bedrock-safe default model. The badge lives at a distinct
+  # path so it never clobbers a statusline the user already set in ~/.claude/settings.json.
+  STATUSLINE_SRC="$(dirname "$0")/statusline.sh"
+  STATUSLINE_DST="$HOME/.claude/bedrock-statusline.sh"
+  if [ -f "$STATUSLINE_SRC" ]; then
+    cp "$STATUSLINE_SRC" "$STATUSLINE_DST" && chmod +x "$STATUSLINE_DST"
+    echo "Installed statusline badge → $STATUSLINE_DST"
+  fi
+  if [ "$ISOLATE" -eq 1 ]; then
+    mkdir -p "$CONFIG_DIR"
+    SEED="$CONFIG_DIR/settings.json"
+    if [ ! -f "$SEED" ]; then
+      jq -n --arg sl "$STATUSLINE_DST" \
+        '{model:"opus", statusLine:{type:"command", command:$sl}}' > "$SEED"
+      echo "Seeded isolated Bedrock config → $SEED"
+    fi
+  fi
 
   # 'claude-bedrock' with no --project sources bedrock-default.sh. Point it at the
   # first project configured; leave an existing default alone (don't hijack it on
@@ -281,11 +365,22 @@ EOF
     local proj="" app=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        --project)      proj=$2; shift 2 ;;
-        --application)  app=$2;  shift 2 ;;
+        --project)
+          [ $# -ge 2 ] || { echo "claude-bedrock: --project needs a value" >&2; return 1; }
+          proj=$2; shift 2 ;;
+        --application)
+          [ $# -ge 2 ] || { echo "claude-bedrock: --application needs a value" >&2; return 1; }
+          app=$2; shift 2 ;;
         *) break ;;
       esac
     done
+    # --application without --project means "the default project's <app>". Read the
+    # default project from the default launcher itself (its exported CLAUDE_BEDROCK_PROJECT
+    # is the single source of truth), so repointing the default can't desync it.
+    if [ -z "$proj" ] && [ -n "$app" ]; then
+      proj=$( . "$HOME/.claude/bedrock-default.sh" >/dev/null 2>&1; printf %s "${CLAUDE_BEDROCK_PROJECT:-}" )
+      [ -n "$proj" ] || { echo "claude-bedrock: pass --project with --application (couldn't resolve the default project)" >&2; return 1; }
+    fi
     local f="$HOME/.claude/bedrock-default.sh"
     [ -n "$proj" ] && f="$HOME/.claude/bedrock-${proj}${app:+-$app}.sh"
     if [ ! -f "$f" ]; then
@@ -345,6 +440,23 @@ if [ ! -f "$SETTINGS_FILE" ]; then
   echo '{}' > "$SETTINGS_FILE"
 fi
 
+# Fail clearly on a pre-existing but malformed settings.json instead of letting the
+# first jq call fail with stderr suppressed and abort the script silently under set -e.
+if ! jq -e . "$SETTINGS_FILE" >/dev/null 2>&1; then
+  echo "Error: $SETTINGS_FILE is not valid JSON. Fix or remove it, then re-run." >&2
+  exit 1
+fi
+
+# Settings mode bakes AWS_PROFILE in (settings.json can't bridge at runtime like the
+# launcher does). Claude Code's SDK ignores AWS_DEFAULT_PROFILE, so without this a
+# global-default Bedrock config can't resolve SSO credentials.
+if [ -n "$RESOLVED_PROFILE" ]; then
+  ENV_JSON=$(echo "$ENV_JSON" | jq -c --arg p "$RESOLVED_PROFILE" '. + {AWS_PROFILE: $p}')
+else
+  echo "Note: no AWS profile detected. Pass --aws-profile NAME (or export AWS_PROFILE)" >&2
+  echo "  so Claude Code can resolve SSO credentials — it does not read AWS_DEFAULT_PROFILE." >&2
+fi
+
 # Check for existing model env vars that would be overwritten
 EXISTING_ENV=$(jq -r '.env // {} | keys[]' "$SETTINGS_FILE" 2>/dev/null)
 CONFLICTS=""
@@ -361,7 +473,9 @@ done
 if [ -n "$CONFLICTS" ]; then
   echo "The following env vars in $SETTINGS_FILE will be overwritten:"
   echo ""
-  printf "$CONFLICTS"
+  # %b interprets the \n escapes in CONFLICTS without treating the embedded old/new
+  # values (which may contain %) as printf format directives.
+  printf '%b' "$CONFLICTS"
   echo ""
   if [ "$ASSUME_YES" -eq 1 ] || [ ! -t 0 ]; then
     # Non-interactive (e.g. run by the setup skill via a non-tty) or --yes:

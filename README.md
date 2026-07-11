@@ -70,7 +70,7 @@ Either way, pick a model with `/model` — tagged profiles show up with friendly
 
 ## Using Bedrock alongside an Anthropic subscription
 
-A Claude Code session uses **one** backend: when `CLAUDE_CODE_USE_BEDROCK=1` is set it goes to Bedrock, otherwise it falls back to your Anthropic subscription login (`/login`). The two auth methods don't collide, so a single `~/.claude` profile can serve both — you never re-authenticate when switching.
+A Claude Code session uses **one** backend: when `CLAUDE_CODE_USE_BEDROCK=1` is set it goes to Bedrock, otherwise it falls back to your Anthropic subscription login (`/login`). The two auth methods don't collide (Bedrock uses your AWS credentials; the subscription uses OAuth).
 
 By default the setup writes Bedrock into `~/.claude/settings.json`, making it the global default for every session. To instead keep your subscription as the default and opt into Bedrock per launch, use **launcher mode**:
 
@@ -83,7 +83,13 @@ This writes `~/.claude/bedrock-my_project.sh` (the Bedrock env vars) and prints 
 - `claude` → your Anthropic subscription (settings.json is left untouched)
 - `claude-bedrock` → tagged Bedrock profiles (run `aws sso login` first)
 
-The subshell in the wrapper keeps the env vars out of your normal shell, so plain `claude` is unaffected. This works because shell environment variables take precedence over `settings.json`. If you want *fully separate* history/MCP/memory between the two, point `CLAUDE_CONFIG_DIR` at a second directory instead — but that requires a separate `/login`.
+The subshell in the wrapper keeps the env vars out of your normal shell, so plain `claude` is unaffected (shell environment variables take precedence over `settings.json`). Three things the launcher sets up for you:
+
+- **`AWS_PROFILE` bridge.** Claude Code's AWS SDK reads `AWS_PROFILE` (not the `AWS_DEFAULT_PROFILE` the AWS CLI often uses); without it, Bedrock calls hang ~60s on the default credential chain and fail. The launcher bridges whatever profile your shell resolves — override with `--aws-profile NAME` or by exporting `AWS_PROFILE` first.
+- **Isolated config** (`CLAUDE_CONFIG_DIR=~/.claude-bedrock`). This keeps a `/model` pick in a Bedrock session from rewriting your subscription's default model — otherwise selecting a Bedrock-only model (whose id is invalid on the Anthropic API) would break plain `claude`. Bedrock uses AWS auth, so this needs no separate `/login`. Pass `--shared-config` to opt out and share `~/.claude` instead.
+- **A cost-attribution badge** in the statusline: green ⬢ = a project-tagged profile (safe to bill), yellow ⚠ = on Bedrock but an untagged model, dim ○ = your subscription. It never claims "subscription" while a session is really on Bedrock.
+
+> **Preview/promo models (e.g. Fable):** these are often blocked by AWS org policies on Bedrock — an SCP may deny creating a tagged profile and/or your identity policy may deny invoking the raw system profile — so they can be unusable on Bedrock regardless of tagging. They still work on your Anthropic subscription (plain `claude`).
 
 ### Switching project / application at launch
 

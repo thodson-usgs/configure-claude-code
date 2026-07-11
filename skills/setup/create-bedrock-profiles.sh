@@ -63,12 +63,15 @@ EOF
   exit 1
 }
 
+# Each value-taking flag reads $2 via ${2:?...} so a flag passed as the final token
+# fails with a clear "requires a value" message instead of a cryptic `$2: unbound
+# variable` abort under `set -u`.
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --project-id)  PROJECT_ID="$2";  shift 2 ;;
-    --app-id)      APP_ID="$2";      shift 2 ;;
-    --contact)     CONTACT="$2";     shift 2 ;;
-    --region)      AWS_REGION="$2";  shift 2 ;;
+    --project-id)  PROJECT_ID="${2:?--project-id requires a value}";  shift 2 ;;
+    --app-id)      APP_ID="${2:?--app-id requires a value}";          shift 2 ;;
+    --contact)     CONTACT="${2:?--contact requires a value}";        shift 2 ;;
+    --region)      AWS_REGION="${2:?--region requires a value}";      shift 2 ;;
     -h|--help)     usage ;;
     *) echo "Unknown option: $1"; usage ;;
   esac
@@ -98,16 +101,23 @@ echo "AWS Account: $ACCOUNT_ID  Region: $AWS_REGION"
 # account/region rather than aborting the whole run — one unavailable model (a
 # newer release not yet enabled, or one absent in this region) shouldn't block
 # creating profiles for the models that are available.
+#
+# One list call + a jq membership check per model, rather than a get-inference-profile
+# round-trip per model (fewer requests, less throttling exposure as MODELS grows).
 echo ""
 echo "Validating ${#MODELS[@]} model(s)..."
 
 ACCOUNT_ARN_PREFIX="arn:aws:bedrock:${AWS_REGION}:${ACCOUNT_ID}"
 
+AVAILABLE_MODELS=$(aws bedrock list-inference-profiles \
+  --type-equals SYSTEM_DEFINED \
+  --region "$AWS_REGION" \
+  --query 'inferenceProfileSummaries[].inferenceProfileId' \
+  --output json)
+
 VALID_MODELS=()
 for SYSTEM_ID in "${MODELS[@]}"; do
-  if aws bedrock get-inference-profile \
-      --inference-profile-identifier "$SYSTEM_ID" \
-      --region "$AWS_REGION" &>/dev/null; then
+  if echo "$AVAILABLE_MODELS" | jq -e --arg id "$SYSTEM_ID" 'index($id) != null' &>/dev/null; then
     VALID_MODELS+=("$SYSTEM_ID")
   else
     echo "  SKIP  $SYSTEM_ID (no system inference profile in $AWS_REGION)" >&2
@@ -140,7 +150,11 @@ TAGS=$(jq -nc \
 for SYSTEM_ID in "${VALID_MODELS[@]}"; do
   SYSTEM_ARN="${ACCOUNT_ARN_PREFIX}:inference-profile/${SYSTEM_ID}"
 
-  MODEL_SLUG=$(echo "$SYSTEM_ID" | sed 's/^us\.anthropic\.//' | tr '.:' '--')
+  # Strip the "us.anthropic." prefix and replace '.'/':' with '-' using bash
+  # parameter expansion — no subprocess, and portable (GNU `tr '.:' '--'` treats the
+  # '--' set as end-of-options and errors).
+  MODEL_SLUG="${SYSTEM_ID#us.anthropic.}"
+  MODEL_SLUG="${MODEL_SLUG//[.:]/-}"
   PROFILE_NAME="${PROJECT_ID}-${APP_ID}-${MODEL_SLUG}"
 
   if echo "$EXISTING_PROFILES" | jq -e --arg name "$PROFILE_NAME" 'index($name) != null' &>/dev/null; then
