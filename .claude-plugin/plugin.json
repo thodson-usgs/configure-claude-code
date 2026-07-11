@@ -1,0 +1,10 @@
+{
+  "name": "bedrock-profiles",
+  "description": "Set up Claude Code with tagged AWS Bedrock inference profiles for cost attribution",
+  "version": "1.0.0",
+  "author": {
+    "name": "thodson-usgs"
+  },
+  "repository": "https://github.com/thodson-usgs/configure-claude-code",
+  "license": "MIT"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "thodson-usgs-bedrock-profiles",
+  "owner": {
+    "name": "thodson-usgs"
+  },
+  "plugins": [
+    {
+      "name": "bedrock-profiles",
+      "source": ".",
+      "description": "Set up Claude Code with tagged AWS Bedrock inference profiles for cost attribution"
+    }
+  ]
+}
