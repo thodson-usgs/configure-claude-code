@@ -115,10 +115,22 @@ AVAILABLE_MODELS=$(aws bedrock list-inference-profiles \
   --query 'inferenceProfileSummaries[].inferenceProfileId' \
   --output json)
 
+# A MODELS entry may be written bare (us.anthropic.claude-opus-4-8) while Bedrock lists
+# the system profile with a date/version suffix (…-4-8-20260101-v1:0). Accept an exact
+# match, else the newest profile whose id begins with the requested one followed by a
+# '-' or ':' delimiter (so "…-sonnet-5" can't spuriously match "…-sonnet-50"). Resolve to
+# the actual available id so the copyFrom ARN and profile slug use the real profile.
 VALID_MODELS=()
 for SYSTEM_ID in "${MODELS[@]}"; do
-  if echo "$AVAILABLE_MODELS" | jq -e --arg id "$SYSTEM_ID" 'index($id) != null' &>/dev/null; then
-    VALID_MODELS+=("$SYSTEM_ID")
+  RESOLVED_ID=$(echo "$AVAILABLE_MODELS" | jq -r --arg id "$SYSTEM_ID" '
+    (map(select(. == $id)) | .[0])
+    // (map(select(startswith($id + "-") or startswith($id + ":"))) | sort | last)
+    // empty')
+  if [ -n "$RESOLVED_ID" ]; then
+    VALID_MODELS+=("$RESOLVED_ID")
+    if [ "$RESOLVED_ID" != "$SYSTEM_ID" ]; then
+      echo "  MATCH $SYSTEM_ID → $RESOLVED_ID"
+    fi
   else
     echo "  SKIP  $SYSTEM_ID (no system inference profile in $AWS_REGION)" >&2
   fi

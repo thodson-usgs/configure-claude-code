@@ -146,8 +146,8 @@ CANDIDATES=$(echo "$ALL_PROFILES" | jq -c --arg p "${PROJECT_ID}-" \
   '[.inferenceProfileSummaries[] | select(.inferenceProfileName | startswith($p))]')
 
 MATCHES=""
-RESOLVED_APP="$APP_ID"   # app/contact from the matched profiles' tags, baked into the
-RESOLVED_CONTACT=""      # launcher so `claude-bedrock --update-profiles` can re-create.
+APP_PAIRS=""             # every (app<TAB>contact) this scope covers — a project-scoped
+                         # launcher spans all the project's apps, each with its own contact.
 while IFS= read -r PROF; do
   ARN=$(echo "$PROF" | jq -r '.inferenceProfileArn')
   TAGS=$(aws bedrock list-tags-for-resource --resource-arn "$ARN" --region "$AWS_REGION" \
@@ -158,9 +158,18 @@ while IFS= read -r PROF; do
   [ "$PID" = "$PROJECT_ID" ] || continue
   if [ -n "$APP_ID" ] && [ "$AID" != "$APP_ID" ]; then continue; fi
   MATCHES="${MATCHES}${PROF}"$'\n'
-  [ -z "$RESOLVED_APP" ] && RESOLVED_APP="$AID"
-  RESOLVED_CONTACT="$CID"
+  APP_PAIRS="${APP_PAIRS}${AID}"$'\t'"${CID}"$'\n'
 done < <(echo "$CANDIDATES" | jq -c '.[]')
+
+# Dedup pairs by application, keeping the first contact seen for each (deterministic in
+# API order). This is the authoritative per-app contact list `--update-profiles` re-tags with.
+APP_PAIRS=$(printf '%s' "$APP_PAIRS" | awk -F'\t' 'NF && !seen[$1]++')
+
+# The representative app/contact baked into the launcher (app-scoped reconfigure path and
+# legacy fallback) is just the first deduped pair — one source of truth (APP_PAIRS), so the
+# two can't come from different applications. --app-id, when given, pins the app explicitly.
+RESOLVED_APP="${APP_ID:-$(printf '%s\n' "$APP_PAIRS" | head -n1 | cut -f1)}"
+RESOLVED_CONTACT=$(printf '%s\n' "$APP_PAIRS" | head -n1 | cut -f2)
 
 # Slurp the matched objects once rather than rebuilding a growing array each iteration.
 PROJECT_PROFILES=$(printf '%s' "$MATCHES" | jq -sc '.')
@@ -202,10 +211,15 @@ CLASSIFIED=$(echo "$PROJECT_PROFILES" | jq -c '
      else null
      end) as $match |
     if $match then
-      (if (.tiers[$match.tier] == null) or ($match.rank >= .tiers[$match.tier].rank)
-       then .tiers[$match.tier] = {arn: $p.inferenceProfileArn, name: $match.name, rank: $match.rank}
+      ($p.inferenceProfileArn) as $arn |
+      # Winner = highest rank; on a rank TIE break by smallest ARN so the choice is
+      # deterministic (independent of API listing order) and matches the COLLISIONS report.
+      (if (.tiers[$match.tier] == null)
+          or ($match.rank > .tiers[$match.tier].rank)
+          or ($match.rank == .tiers[$match.tier].rank and $arn < .tiers[$match.tier].arn)
+       then .tiers[$match.tier] = {arn: $arn, name: $match.name, rank: $match.rank}
        else . end)
-      | .matches += [{tier: $match.tier, name: $match.name, arn: $p.inferenceProfileArn, rank: $match.rank}]
+      | .matches += [{tier: $match.tier, name: $match.name, arn: $arn, rank: $match.rank}]
     else
       .extras += [{arn: $p.inferenceProfileArn, model: $model_id}]
     end
@@ -233,9 +247,11 @@ fi
 # older ones are being ignored so a leftover version isn't a surprise. Derived from the
 # same classification pass, so it can't drift from the tier logic.
 COLLISIONS=$(echo "$CLASSIFIED" | jq -r '
-  .matches | group_by(.tier) | map(select(length > 1))[]
-  | (max_by(.rank)) as $keep
-  | "  \(.[0].tier): using \($keep.name); ignoring older \([.[] | select(.arn != $keep.arn) | .name] | unique | join(", "))"')
+  # Read the winner the reduce already picked (.tiers) rather than re-deriving the
+  # ordering here — one source of truth, so the note can never disagree with what is wired.
+  . as $root | .matches | group_by(.tier) | map(select(length > 1))[]
+  | .[0].tier as $tier | $root.tiers[$tier] as $keep
+  | "  \($tier): using \($keep.name); ignoring older \([.[] | select(.arn != $keep.arn) | .name] | unique | join(", "))"')
 if [ -n "$COLLISIONS" ]; then
   echo "Note: multiple versions map to the same tier — using the newest:" >&2
   echo "$COLLISIONS" >&2
@@ -319,6 +335,12 @@ if [ "$OUTPUT" = "launcher" ]; then
   # must reconfigure the SAME way (with/without --app-id) so it rewrites this same file.
   if [ -n "$APP_ID" ]; then APP_SCOPED=1; else APP_SCOPED=0; fi
 
+  # Every (app, contact) pair this launcher covers, as a compact JSON array. A project-scoped
+  # launcher spans all the project's apps, so `--update-profiles` must recreate profiles for
+  # EACH — not just the representative CLAUDE_BEDROCK_APP — using each app's own contact.
+  APP_PAIRS_JSON=$(printf '%s' "$APP_PAIRS" | jq -Rsc '
+    split("\n") | map(select(length > 0) | split("\t") | {app: .[0], contact: .[1]})')
+
   {
     cat <<EOF
 #!/usr/bin/env bash
@@ -337,6 +359,10 @@ EOF
     jq -rn --arg a "$RESOLVED_APP" --arg c "$RESOLVED_CONTACT" --arg d "$SETUP_DIR" \
       '"export CLAUDE_BEDROCK_APP=\($a|@sh)", "export CLAUDE_BEDROCK_CONTACT=\($c|@sh)", "export CLAUDE_BEDROCK_SETUP_DIR=\($d|@sh)"'
     echo "export CLAUDE_BEDROCK_APP_SCOPED='$APP_SCOPED'"
+    # Full per-app (app, contact) coverage for --update-profiles (see wrapper). A project-scoped
+    # launcher recreates every app's profiles with that app's own contact; an app-scoped one
+    # holds a single entry. @sh-quoted so it survives sourcing intact.
+    jq -rn --argjson pairs "$APP_PAIRS_JSON" '"export CLAUDE_BEDROCK_APP_PAIRS=\($pairs|tojson|@sh)"'
     if [ -n "$EXTRA_EXPORTS" ]; then
       echo ""
       echo "# Profiles with no Claude Code tier (opus/sonnet/haiku). Uncomment ONE to"
@@ -369,9 +395,17 @@ EOF
   # first project configured; leave an existing default alone (don't hijack it on
   # a later run) but show how to repoint. Only touch it if it's our symlink or absent.
   DEFAULT_LINK="$HOME/.claude/bedrock-default.sh"
-  if [ ! -e "$DEFAULT_LINK" ] && [ ! -L "$DEFAULT_LINK" ]; then
-    ln -s "bedrock-${LAUNCHER_SLUG}.sh" "$DEFAULT_LINK"
-    echo "Set default for bare 'claude-bedrock' → ${LAUNCHER_SLUG}"
+  # `! -e` is true when the link is absent OR dangling (a broken symlink fails -e but
+  # passes -L). Either way, (re)point it at this launcher; -f handles the dangling case.
+  # Note whether it was a dangling link *before* creating it (afterwards -L is always true).
+  if [ ! -e "$DEFAULT_LINK" ]; then
+    [ -L "$DEFAULT_LINK" ] && WAS_DANGLING=1 || WAS_DANGLING=0
+    ln -sf "bedrock-${LAUNCHER_SLUG}.sh" "$DEFAULT_LINK"
+    if [ "$WAS_DANGLING" -eq 1 ]; then
+      echo "Default for bare 'claude-bedrock' was dangling → repointed to ${LAUNCHER_SLUG}"
+    else
+      echo "Set default for bare 'claude-bedrock' → ${LAUNCHER_SLUG}"
+    fi
   elif [ -L "$DEFAULT_LINK" ]; then
     echo "Default for bare 'claude-bedrock' stays: $(readlink "$DEFAULT_LINK" | sed 's/^bedrock-//;s/\.sh$//')"
     echo "  Repoint it with: ln -sf bedrock-${LAUNCHER_SLUG}.sh \"$DEFAULT_LINK\""
@@ -420,8 +454,26 @@ EOF
           echo "Re-run /bedrock-profiles:setup (or configure-claude-cli.sh) to refresh the launcher." >&2
           exit 1
         fi
-        bash "$d/create-bedrock-profiles.sh" --project-id "$CLAUDE_BEDROCK_PROJECT" \
-          --app-id "$CLAUDE_BEDROCK_APP" --contact "$CLAUDE_BEDROCK_CONTACT" --region "$AWS_REGION" || exit $?
+        # A project-scoped launcher covers every app under the project; recreate profiles
+        # for EACH (using that app's own contact) so a newly-added model reaches all of
+        # them, not just the representative CLAUDE_BEDROCK_APP. CLAUDE_BEDROCK_APP_PAIRS is a
+        # JSON array baked by configure; fall back to the single APP/CONTACT for launchers
+        # written before it existed.
+        pairs="${CLAUDE_BEDROCK_APP_PAIRS:-}"
+        [ -n "$pairs" ] || pairs=$(printf '[{"app":%s,"contact":%s}]' \
+          "$(printf %s "$CLAUDE_BEDROCK_APP" | jq -R .)" \
+          "$(printf %s "$CLAUDE_BEDROCK_CONTACT" | jq -R .)")
+        while IFS=$'\t' read -r a c; do
+          [ -n "$a" ] || continue
+          if [ -z "$c" ]; then
+            # create-bedrock-profiles.sh requires --contact; skip this app with a warning
+            # instead of aborting the whole update (which would strand the other apps too).
+            echo "claude-bedrock: skipping app '$a' (no wma:contact recorded); re-run setup to add one." >&2
+            continue
+          fi
+          bash "$d/create-bedrock-profiles.sh" --project-id "$CLAUDE_BEDROCK_PROJECT" \
+            --app-id "$a" --contact "$c" --region "$AWS_REGION" || exit $?
+        done < <(printf %s "$pairs" | jq -r '.[] | [.app, .contact] | @tsv')
         # Reconfigure the same way this launcher was created (app-scoped or not) so the
         # same file is rewritten rather than a differently-named one.
         if [ "${CLAUDE_BEDROCK_APP_SCOPED:-0}" = 1 ]; then
