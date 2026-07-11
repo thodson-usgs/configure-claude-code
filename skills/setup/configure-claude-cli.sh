@@ -146,16 +146,20 @@ CANDIDATES=$(echo "$ALL_PROFILES" | jq -c --arg p "${PROJECT_ID}-" \
   '[.inferenceProfileSummaries[] | select(.inferenceProfileName | startswith($p))]')
 
 MATCHES=""
+RESOLVED_APP="$APP_ID"   # app/contact from the matched profiles' tags, baked into the
+RESOLVED_CONTACT=""      # launcher so `claude-bedrock --update-profiles` can re-create.
 while IFS= read -r PROF; do
   ARN=$(echo "$PROF" | jq -r '.inferenceProfileArn')
   TAGS=$(aws bedrock list-tags-for-resource --resource-arn "$ARN" --region "$AWS_REGION" \
     --query 'tags' --output json 2>/dev/null || echo '[]')
-  # One jq pass pulls both tag values (empty string when a tag is absent).
-  IFS=$'\t' read -r PID AID < <(echo "$TAGS" | jq -r \
-    'from_entries as $t | "\($t["wma:project_id"] // "")\t\($t["wma:application_id"] // "")"')
+  # One jq pass pulls the tag values we need (empty string when a tag is absent).
+  IFS=$'\t' read -r PID AID CID < <(echo "$TAGS" | jq -r \
+    'from_entries as $t | "\($t["wma:project_id"] // "")\t\($t["wma:application_id"] // "")\t\($t["wma:contact"] // "")"')
   [ "$PID" = "$PROJECT_ID" ] || continue
   if [ -n "$APP_ID" ] && [ "$AID" != "$APP_ID" ]; then continue; fi
   MATCHES="${MATCHES}${PROF}"$'\n'
+  [ -z "$RESOLVED_APP" ] && RESOLVED_APP="$AID"
+  RESOLVED_CONTACT="$CID"
 done < <(echo "$CANDIDATES" | jq -c '.[]')
 
 # Slurp the matched objects once rather than rebuilding a growing array each iteration.
@@ -173,29 +177,35 @@ echo "Found $PROFILE_COUNT profile(s)."
 # For each profile, inspect the underlying foundation model to determine the
 # tier (opus/sonnet/haiku) and derive a friendly display name.
 
+# `rank` orders versions WITHIN a tier (higher = newer). When several profiles map to
+# the same tier (e.g. a leftover Opus 4.6 alongside a new Opus 4.8), the highest rank
+# wins deterministically — so upgrading models is just "create the new profile + re-run
+# configure", with no need to delete the old one first.
 CLASSIFIED=$(echo "$PROJECT_PROFILES" | jq -c '
   reduce .[] as $p ({tiers: {}, extras: [], matches: []};
     ($p.models[0].modelArn | split("/") | last) as $model_id |
-    (if   ($model_id | test("opus-4-8"))   then {tier: "OPUS",   name: "Opus 4.8"}
-     elif ($model_id | test("opus-4-7"))   then {tier: "OPUS",   name: "Opus 4.7"}
-     elif ($model_id | test("opus-4-6"))   then {tier: "OPUS",   name: "Opus 4.6"}
-     elif ($model_id | test("opus-4-5"))   then {tier: "OPUS",   name: "Opus 4.5"}
-     elif ($model_id | test("opus-4-1"))   then {tier: "OPUS",   name: "Opus 4.1"}
-     elif ($model_id | test("opus-4-"))    then {tier: "OPUS",   name: "Opus 4"}
-     elif ($model_id | test("opus"))       then {tier: "OPUS",   name: "Opus"}
-     elif ($model_id | test("sonnet-5"))   then {tier: "SONNET", name: "Sonnet 5"}
-     elif ($model_id | test("sonnet-4-6")) then {tier: "SONNET", name: "Sonnet 4.6"}
-     elif ($model_id | test("sonnet-4-5")) then {tier: "SONNET", name: "Sonnet 4.5"}
-     elif ($model_id | test("sonnet-4-"))  then {tier: "SONNET", name: "Sonnet 4"}
-     elif ($model_id | test("3-7-sonnet")) then {tier: "SONNET", name: "Sonnet 3.7"}
-     elif ($model_id | test("sonnet"))     then {tier: "SONNET", name: "Sonnet"}
-     elif ($model_id | test("haiku-4-5"))  then {tier: "HAIKU",  name: "Haiku 4.5"}
-     elif ($model_id | test("haiku"))      then {tier: "HAIKU",  name: "Haiku"}
+    (if   ($model_id | test("opus-4-8"))   then {tier: "OPUS",   name: "Opus 4.8",   rank: 48}
+     elif ($model_id | test("opus-4-7"))   then {tier: "OPUS",   name: "Opus 4.7",   rank: 47}
+     elif ($model_id | test("opus-4-6"))   then {tier: "OPUS",   name: "Opus 4.6",   rank: 46}
+     elif ($model_id | test("opus-4-5"))   then {tier: "OPUS",   name: "Opus 4.5",   rank: 45}
+     elif ($model_id | test("opus-4-1"))   then {tier: "OPUS",   name: "Opus 4.1",   rank: 41}
+     elif ($model_id | test("opus-4-"))    then {tier: "OPUS",   name: "Opus 4",     rank: 40}
+     elif ($model_id | test("opus"))       then {tier: "OPUS",   name: "Opus",       rank: 10}
+     elif ($model_id | test("sonnet-5"))   then {tier: "SONNET", name: "Sonnet 5",   rank: 50}
+     elif ($model_id | test("sonnet-4-6")) then {tier: "SONNET", name: "Sonnet 4.6", rank: 46}
+     elif ($model_id | test("sonnet-4-5")) then {tier: "SONNET", name: "Sonnet 4.5", rank: 45}
+     elif ($model_id | test("sonnet-4-"))  then {tier: "SONNET", name: "Sonnet 4",   rank: 40}
+     elif ($model_id | test("3-7-sonnet")) then {tier: "SONNET", name: "Sonnet 3.7", rank: 37}
+     elif ($model_id | test("sonnet"))     then {tier: "SONNET", name: "Sonnet",     rank: 10}
+     elif ($model_id | test("haiku-4-5"))  then {tier: "HAIKU",  name: "Haiku 4.5",  rank: 45}
+     elif ($model_id | test("haiku"))      then {tier: "HAIKU",  name: "Haiku",      rank: 10}
      else null
      end) as $match |
     if $match then
-      (.tiers[$match.tier] = {arn: $p.inferenceProfileArn, name: $match.name})
-      | .matches += [{tier: $match.tier, arn: $p.inferenceProfileArn}]
+      (if (.tiers[$match.tier] == null) or ($match.rank >= .tiers[$match.tier].rank)
+       then .tiers[$match.tier] = {arn: $p.inferenceProfileArn, name: $match.name, rank: $match.rank}
+       else . end)
+      | .matches += [{tier: $match.tier, name: $match.name, arn: $p.inferenceProfileArn, rank: $match.rank}]
     else
       .extras += [{arn: $p.inferenceProfileArn, model: $model_id}]
     end
@@ -219,17 +229,17 @@ if [ "$MATCHED" -eq 0 ] && [ "$EXTRA_COUNT" -eq 0 ]; then
   exit 1
 fi
 
-# Warn when several profiles map to the same tier: only one wins (the fold keeps
-# just one, in unspecified order), so a stale model version left over from an
-# earlier run can silently shadow the intended one. Derived from the same
-# classification pass, so it can't drift from the tier logic.
+# When several profiles map to one tier, the newest (highest rank) is wired; note which
+# older ones are being ignored so a leftover version isn't a surprise. Derived from the
+# same classification pass, so it can't drift from the tier logic.
 COLLISIONS=$(echo "$CLASSIFIED" | jq -r '
   .matches | group_by(.tier) | map(select(length > 1))[]
-  | "  \(.[0].tier): \(length) profiles map here (one chosen arbitrarily) → \([.[].arn] | join(", "))"')
+  | (max_by(.rank)) as $keep
+  | "  \(.[0].tier): using \($keep.name); ignoring older \([.[] | select(.arn != $keep.arn) | .name] | unique | join(", "))"')
 if [ -n "$COLLISIONS" ]; then
-  echo "Warning: multiple profiles map to the same Claude Code tier:" >&2
+  echo "Note: multiple versions map to the same tier — using the newest:" >&2
   echo "$COLLISIONS" >&2
-  echo "  Narrow with --app-id, or delete stale profiles, to make the choice unambiguous." >&2
+  echo "  (Delete the older profiles if you want them gone; they're otherwise ignored.)" >&2
 fi
 
 # Print what was found
@@ -302,6 +312,10 @@ if [ "$OUTPUT" = "launcher" ]; then
     CONFIG_DIR_LINE='# config isolation disabled (--shared-config): shares ~/.claude'
   fi
 
+  # Absolute path to these scripts, baked so `claude-bedrock --update-profiles` can find
+  # create/configure later (falls back gracefully in the wrapper if it ever moves).
+  SETUP_DIR=$(cd "$(dirname "$0")" && pwd)
+
   {
     cat <<EOF
 #!/usr/bin/env bash
@@ -316,6 +330,9 @@ EOF
     echo "$ENV_JSON" | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"'
     jq -rn --arg p "$PROJECT_ID" '"export CLAUDE_BEDROCK_PROJECT=\($p|@sh)  # statusline cost-attribution badge"'
     echo "$CONFIG_DIR_LINE"
+    # Baked so `claude-bedrock --update-profiles` can re-run create + configure unattended.
+    jq -rn --arg a "$RESOLVED_APP" --arg c "$RESOLVED_CONTACT" --arg d "$SETUP_DIR" \
+      '"export CLAUDE_BEDROCK_APP=\($a|@sh)", "export CLAUDE_BEDROCK_CONTACT=\($c|@sh)", "export CLAUDE_BEDROCK_SETUP_DIR=\($d|@sh)"'
     if [ -n "$EXTRA_EXPORTS" ]; then
       echo ""
       echo "# Profiles with no Claude Code tier (opus/sonnet/haiku). Uncomment ONE to"
@@ -362,7 +379,7 @@ EOF
   echo ""
   cat <<'EOF'
   claude-bedrock() {
-    local proj="" app=""
+    local proj="" app="" update=0
     while [ $# -gt 0 ]; do
       case "$1" in
         --project)
@@ -371,6 +388,7 @@ EOF
         --application)
           [ $# -ge 2 ] || { echo "claude-bedrock: --application needs a value" >&2; return 1; }
           app=$2; shift 2 ;;
+        --update-profiles) update=1; shift ;;
         *) break ;;
       esac
     done
@@ -388,6 +406,22 @@ EOF
       echo "Available:" >&2; ls "$HOME"/.claude/bedrock-*.sh >&2 2>/dev/null
       return 1
     fi
+    # --update-profiles: (re)create tagged profiles for the current model list and rewire
+    # this launcher — no session is launched. Uses values baked into the launcher file.
+    if [ "$update" = 1 ]; then
+      ( source "$f" >/dev/null 2>&1
+        d="${CLAUDE_BEDROCK_SETUP_DIR:-}"
+        if [ -z "$d" ] || [ ! -f "$d/create-bedrock-profiles.sh" ]; then
+          echo "claude-bedrock: setup scripts not found (CLAUDE_BEDROCK_SETUP_DIR='$d')." >&2
+          echo "Re-run /bedrock-profiles:setup (or configure-claude-cli.sh) to refresh the launcher." >&2
+          exit 1
+        fi
+        bash "$d/create-bedrock-profiles.sh" --project-id "$CLAUDE_BEDROCK_PROJECT" \
+          --app-id "$CLAUDE_BEDROCK_APP" --contact "$CLAUDE_BEDROCK_CONTACT" --region "$AWS_REGION" &&
+        bash "$d/configure-claude-cli.sh" --project-id "$CLAUDE_BEDROCK_PROJECT" \
+          --app-id "$CLAUDE_BEDROCK_APP" --region "$AWS_REGION" --output launcher --yes )
+      return $?
+    fi
     ( source "$f" && exec claude "$@" )
   }
 EOF
@@ -397,6 +431,8 @@ EOF
   echo "  claude-bedrock                         → default project (bedrock-default.sh)"
   echo "  claude-bedrock --project other         → sources ~/.claude/bedrock-other.sh"
   echo "  claude-bedrock --application notebooks  → sources ~/.claude/bedrock-${PROJECT_ID}-notebooks.sh"
+  echo "  claude-bedrock --update-profiles        → recreate tagged profiles for the latest"
+  echo "                                            models and rewire (no session launched)"
   echo "  Each override needs its own launcher — re-run this script with the matching"
   echo "  --project-id/--app-id to generate it first."
   echo ""

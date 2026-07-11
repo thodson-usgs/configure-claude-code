@@ -75,7 +75,9 @@ aws bedrock list-inference-profiles --type-equals SYSTEM_DEFINED \
   | jq -r '.inferenceProfileSummaries[].inferenceProfileId' | grep anthropic
 ```
 
-When adding a new model version, also add a matching `test(...)` case to the tier-mapping regex in `configure-claude-cli.sh` so the `/model` picker shows a correct friendly name (e.g. "Opus 4.8" rather than the generic "Opus 4").
+When adding a new model version, also add a matching `test(...)` case to the tier-mapping regex in `configure-claude-cli.sh` **with a `rank`** (higher = newer within a tier). On a tier collision `configure` wires the highest-ranked profile, so a leftover old-version profile is ignored rather than forcing a manual delete — creating a new-version profile and re-running `configure` is enough to upgrade.
+
+Launcher users can do the whole update in one command: `claude-bedrock --update-profiles` re-runs `create-bedrock-profiles.sh` + `configure-claude-cli.sh` for that launcher's project/app/contact/region (all baked into the launcher file as `CLAUDE_BEDROCK_APP`/`_CONTACT`/`_SETUP_DIR`) and rewires it — no session is launched. It degrades gracefully with a clear message if `CLAUDE_BEDROCK_SETUP_DIR` no longer points at the scripts (e.g. the plugin moved); re-running the setup skill refreshes it.
 
 ## Testing
 

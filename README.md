@@ -99,9 +99,12 @@ Each launcher file is named `~/.claude/bedrock-<project>[-<app>].sh`. The wrappe
 claude-bedrock                          # default project (~/.claude/bedrock-default.sh)
 claude-bedrock --project other_proj     # sources ~/.claude/bedrock-other_proj.sh
 claude-bedrock --application notebooks  # sources ~/.claude/bedrock-<project>-notebooks.sh
+claude-bedrock --update-profiles        # recreate tagged profiles for the latest models + rewire
 ```
 
 Bare `claude-bedrock` follows `~/.claude/bedrock-default.sh`, a symlink configure points at your first-configured project (so there's always a billable default). Repoint it any time with `ln -sf bedrock-<slug>.sh ~/.claude/bedrock-default.sh`.
+
+**Updating to newer models:** bump the `MODELS` list in `create-bedrock-profiles.sh` (or just pull a newer plugin version), then run `claude-bedrock --update-profiles`. It recreates the tagged profiles for the current models and rewires the launcher; `configure` auto-prefers the newest version per tier, so a leftover old-version profile is ignored rather than blocking the upgrade (delete it separately if you want it gone).
 
 Put `--project`/`--application` **before** any regular `claude` arguments. Each override needs its own launcher first — generate it by re-running configure with the matching `--project-id`/`--app-id`:
 
