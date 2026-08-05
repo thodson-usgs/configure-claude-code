@@ -193,7 +193,8 @@ echo "Found $PROFILE_COUNT profile(s)."
 CLASSIFIED=$(echo "$PROJECT_PROFILES" | jq -c '
   reduce .[] as $p ({tiers: {}, extras: [], matches: []};
     ($p.models[0].modelArn | split("/") | last) as $model_id |
-    (if   ($model_id | test("opus-4-8"))   then {tier: "OPUS",   name: "Opus 4.8",   rank: 48}
+    (if   ($model_id | test("opus-5"))     then {tier: "OPUS",   name: "Opus 5",     rank: 50}
+     elif ($model_id | test("opus-4-8"))   then {tier: "OPUS",   name: "Opus 4.8",   rank: 48}
      elif ($model_id | test("opus-4-7"))   then {tier: "OPUS",   name: "Opus 4.7",   rank: 47}
      elif ($model_id | test("opus-4-6"))   then {tier: "OPUS",   name: "Opus 4.6",   rank: 46}
      elif ($model_id | test("opus-4-5"))   then {tier: "OPUS",   name: "Opus 4.5",   rank: 45}

@@ -30,6 +30,7 @@ set -euo pipefail
 # profile is still created (and tagged) for it, but configure-claude-cli.sh
 # exposes it as an optional main-model override rather than a tier default.
 MODELS=(
+  us.anthropic.claude-opus-5
   us.anthropic.claude-opus-4-8
   us.anthropic.claude-sonnet-5
   us.anthropic.claude-haiku-4-5-20251001-v1:0
